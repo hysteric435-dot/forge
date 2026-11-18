@@ -1,0 +1,222 @@
+name: Build IPA
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer XcodeGen
+        run: brew install xcodegen
+
+      - name: Creer le projet iOS
+        run: |
+          test -f index.html || (echo "index.html manquant a la racine du depot" && exit 1)
+          mkdir -p www FORGE/Assets.xcassets/AppIcon.appiconset
+          cp index.html www/index.html
+          cat > FORGE/AppDelegate.swift <<'EOF_APP'
+          import UIKit
+
+          @main
+          class AppDelegate: UIResponder, UIApplicationDelegate {
+              var window: UIWindow?
+
+              func application(_ application: UIApplication,
+                               didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
+                  // Garde l'écran allumé pendant une séance
+                  application.isIdleTimerDisabled = true
+
+                  let window = UIWindow(frame: UIScreen.main.bounds)
+                  window.rootViewController = WebViewController()
+                  window.makeKeyAndVisible()
+                  self.window = window
+                  return true
+              }
+          }
+          EOF_APP
+          cat > FORGE/WebViewController.swift <<'EOF_WEB'
+          import UIKit
+          import WebKit
+
+          final class WebViewController: UIViewController, WKNavigationDelegate, WKScriptMessageHandler {
+
+              private var webView: WKWebView!
+              private let bg = UIColor(red: 16/255, green: 17/255, blue: 20/255, alpha: 1)
+              private let saveQueue = DispatchQueue(label: "forge.save", qos: .utility)
+
+              // Sauvegarde miroir des données (visible dans l'app Fichiers > FORGE)
+              private var backupURL: URL {
+                  FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                      .appendingPathComponent("forge-data.json")
+              }
+
+              override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
+
+              override func loadView() {
+                  let controller = WKUserContentController()
+
+                  // 1) Restaure la sauvegarde si le localStorage est vide
+                  if let data = try? Data(contentsOf: backupURL),
+                     let backup = String(data: data, encoding: .utf8),
+                     let literal = try? JSONSerialization.data(withJSONObject: backup, options: [.fragmentsAllowed]),
+                     let js = String(data: literal, encoding: .utf8) {
+                      let restore = "try{if(localStorage.getItem('forge')===null){localStorage.setItem('forge',\(js));}}catch(e){}"
+                      controller.addUserScript(WKUserScript(source: restore,
+                                                            injectionTime: .atDocumentStart,
+                                                            forMainFrameOnly: true))
+                  }
+
+                  // 2) Copie chaque enregistrement vers le fichier de sauvegarde
+                  let hook = """
+                  (function(){
+                    var o=Storage.prototype.setItem;
+                    Storage.prototype.setItem=function(k,v){
+                      o.apply(this,arguments);
+                      if(k==='forge'){try{window.webkit.messageHandlers.forge.postMessage(String(v));}catch(e){}}
+                    };
+                  })();
+                  """
+                  controller.addUserScript(WKUserScript(source: hook,
+                                                        injectionTime: .atDocumentStart,
+                                                        forMainFrameOnly: true))
+                  controller.add(self, name: "forge")
+
+                  let config = WKWebViewConfiguration()
+                  config.userContentController = controller
+                  config.allowsInlineMediaPlayback = true
+
+                  webView = WKWebView(frame: .zero, configuration: config)
+                  webView.navigationDelegate = self
+                  webView.isOpaque = false
+                  webView.backgroundColor = bg
+                  webView.scrollView.backgroundColor = bg
+                  webView.scrollView.contentInsetAdjustmentBehavior = .never
+                  webView.scrollView.bounces = false
+                  view = webView
+              }
+
+              override func viewDidLoad() {
+                  super.viewDidLoad()
+                  view.backgroundColor = bg
+                  loadApp()
+              }
+
+              private func loadApp() {
+                  guard let url = Bundle.main.url(forResource: "index", withExtension: "html", subdirectory: "www") else { return }
+                  webView.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
+              }
+
+              // MARK: - WKScriptMessageHandler
+              func userContentController(_ userContentController: WKUserContentController,
+                                         didReceive message: WKScriptMessage) {
+                  guard message.name == "forge", let text = message.body as? String else { return }
+                  let url = backupURL
+                  saveQueue.async {
+                      try? text.write(to: url, atomically: true, encoding: .utf8)
+                  }
+              }
+
+              // MARK: - WKNavigationDelegate
+              func webView(_ webView: WKWebView,
+                           decidePolicyFor navigationAction: WKNavigationAction,
+                           decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+                  if navigationAction.navigationType == .linkActivated,
+                     let url = navigationAction.request.url,
+                     let scheme = url.scheme?.lowercased(),
+                     ["http", "https", "mailto", "tel"].contains(scheme) {
+                      UIApplication.shared.open(url)
+                      decisionHandler(.cancel)
+                      return
+                  }
+                  decisionHandler(.allow)
+              }
+
+              func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+                  loadApp()
+              }
+          }
+          EOF_WEB
+          cat > project.yml <<'EOF_PROJ'
+          name: FORGE
+          options:
+            bundleIdPrefix: com.forge
+            deploymentTarget:
+              iOS: "15.0"
+          targets:
+            FORGE:
+              type: application
+              platform: iOS
+              sources:
+                - path: FORGE
+                - path: www
+                  type: folder
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.forge.musculation
+                  PRODUCT_NAME: FORGE
+                  MARKETING_VERSION: "1.0"
+                  CURRENT_PROJECT_VERSION: "1"
+                  TARGETED_DEVICE_FAMILY: "1"
+                  SWIFT_VERSION: "5.0"
+                  ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+              info:
+                path: FORGE/Info.plist
+                properties:
+                  CFBundleDisplayName: FORGE
+                  UILaunchScreen: {}
+                  UIUserInterfaceStyle: Dark
+                  UISupportedInterfaceOrientations:
+                    - UIInterfaceOrientationPortrait
+                  UIFileSharingEnabled: true
+                  LSSupportsOpeningDocumentsInPlace: true
+          EOF_PROJ
+          echo '{ "info" : { "author" : "xcode", "version" : 1 } }' > FORGE/Assets.xcassets/Contents.json
+          echo '{ "images" : [ { "filename" : "icon.png", "idiom" : "universal", "platform" : "ios", "size" : "1024x1024" } ], "info" : { "author" : "xcode", "version" : 1 } }' > FORGE/Assets.xcassets/AppIcon.appiconset/Contents.json
+          python3 - <<'EOF_PY'
+          import zlib, struct
+          S = 1024
+          bg = bytes((16, 17, 20)); ac = bytes((163, 230, 53))
+          def row(y):
+              r = bytearray(bg * S)
+              if 262 <= y < 762:
+                  x1 = 762 if y < 462 else 562
+                  r[262 * 3:x1 * 3] = ac * (x1 - 262)
+              return b'\x00' + bytes(r)
+          raw = b''.join(row(y) for y in range(S))
+          def ch(t, d):
+              return struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
+          png = b'\x89PNG\r\n\x1a\n' + ch(b'IHDR', struct.pack('>IIBBBBB', S, S, 8, 2, 0, 0, 0)) + ch(b'IDAT', zlib.compress(raw, 9)) + ch(b'IEND', b'')
+          open('FORGE/Assets.xcassets/AppIcon.appiconset/icon.png', 'wb').write(png)
+          EOF_PY
+
+      - name: Generer le projet Xcode
+        run: xcodegen generate
+
+      - name: Compiler sans signature
+        run: |
+          xcodebuild -project FORGE.xcodeproj -scheme FORGE \
+            -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Creer l'IPA
+        run: |
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/FORGE.app Payload/
+          zip -qry FORGE.ipa Payload
+
+      - name: Publier l'IPA (telechargement direct)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: FORGE build ${{ github.run_number }}
+          files: FORGE.ipa
